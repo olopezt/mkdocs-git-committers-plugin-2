@@ -57,13 +57,14 @@ class GitCommittersPlugin(BasePlugin):
         self.branch = self.config['branch']
         return config
 
-    def get_gituser_info(self, email, query):
+    def get_gituser_info(self, query):
         if not hasattr(self, 'auth_header'):
             # No auth token provided: return now
             return None
-        LOG.info("Get user info from GitHub for: " + email)
         r = requests.post(url=self.apiendpoint, json=query, headers=self.auth_header)
         res = r.json()
+        json_formatted_str = json.dumps(res, indent=2)
+        LOG.debug("Json: " + json_formatted_str)
         if r.status_code == 200:
             if res.get('data'):
                 if res['data']['search']['edges']:
@@ -83,66 +84,105 @@ class GitCommittersPlugin(BasePlugin):
         else:
             return None
 
-    def get_git_info(self, path):
-        unique_authors = []
-        seen_authors = []
+    def githubAuthorInfoFromUserOrEmail(self, githubUsername, githubEmail):
+        if (githubUsername not in self.authors and githubEmail not in self.authors):            
+            # Guard
+            if githubUsername is None and githubEmail is None:
+                return None
+
+            # Define queries
+            info = None
+            if githubEmail is not None:
+                LOG.debug("Looking for email " + githubEmail)
+                searchByEmailQuery = """
+                    search(type:USER, query: "in:email %s", first:1) { 
+                        edges { node { ... on User { login name url  } } }
+                    }
+                """ % (githubEmail)
+                query = { 'query': ' {' + searchByEmailQuery + ' }' }
+                info = self.get_gituser_info(query)
+
+                # Assume that the email was wrong and look for it as user
+                if info is None:
+                    LOG.debug("Looking for user " + githubEmail)
+                    searchByEmailQuery = """
+                        search(type:USER, query: "in:user %s", first:1) { 
+                            edges { node { ... on User { login name url  } } }
+                        }
+                    """ % (githubEmail)
+                    query = { 'query': ' {' + searchByEmailQuery + ' }' }
+                    info = self.get_gituser_info(query)
+
+
+            if githubUsername is not None and info is None:
+                LOG.debug("Looking for user " + githubUsername)
+                searchByUserQuery = """
+                    search(type:USER, query: "in:user %s", first:1) { 
+                        edges { node { ... on User { login name url  } } }
+                    }
+                """ % (githubUsername)
+                query = { 'query': ' {' + searchByUserQuery + ' }' }
+                info = self.get_gituser_info(query)
+
+            # Search
+            if info:
+                LOG.debug("      Found!")
+                if (githubEmail is not None):
+                    LOG.debug("Registered " + githubEmail + " as " + info['login'])
+                    author_id = githubEmail
+                elif (githubUsername is not None):
+                    LOG.debug("Registered " + githubUsername + " as " + info['login'])
+                    author_id = githubUsername
+                self.authors[author_id] = info
+            else:
+                LOG.debug("Not found for user " + githubUsername + " and email " + githubEmail)
+                return None, None
+        else:
+            if (githubEmail in self.authors):
+                author_id = githubEmail
+            if (githubUsername in self.authors):
+                author_id = githubUsername
+            info = self.authors[author_id]
+        return author_id, info
+
+
+    def get_git_info(self, path, page):
         last_commit_date = ""
+        unique_authors = []
+        seen_authors = [] 
         LOG.debug("get_git_info for " + path)
+
+        # Add contributors from commit info
         for c in Commit.iter_items(self.localrepo, self.localrepo.head, path):
+            c.author.email = c.author.email.lower()
+            # Clean up the email address
+            c.author.email = re.sub('\d*\+', '', c.author.email.replace("@users.noreply.github.com", ""))
+
             author_id = ""
             if not last_commit_date:
                 # Use the last commit and get the date
                 last_commit_date = time.strftime("%Y-%m-%d", time.gmtime(c.authored_date))
-            c.author.email = c.author.email.lower()
-            # Clean up the email address
-            c.author.email = re.sub('\d*\+', '', c.author.email.replace("@users.noreply.github.com", ""))
-            if not (c.author.email in self.authors) and not (c.author.name in self.authors):
-                # Not in cache: let's ask GitHub
-                #self.authors[c.author.email] = {}
-                # First, search by email
-                info = self.get_gituser_info( c.author.email, \
-                    { 'query': '{ search(type: USER, query: "in:email ' + c.author.email + '", first: 1) { edges { node { ... on User { login name url } } } } }' })
-                if info:
-                    LOG.debug("      Found!")
-                    author_id = c.author.email
-                else:
-                    # If not found, search by name, expecting it to be GitHub user name
-                    LOG.debug("   User not found yet, trying with GitHub username: " + c.author.name)
-                    info = self.get_gituser_info( c.author.name, \
-                        { 'query': '{ search(type: USER, query: "in:user ' + c.author.name + '", first: 1) { edges { node { ... on User { login name url } } } } }' })
-                    if info:
-                        LOG.debug("      Found!")
-                        author_id = c.author.name
-                    else:
-                        # If not found, search by name
-                        LOG.debug("   User not found by email, search by name: " + c.author.name)
-                        info = self.get_gituser_info( c.author.name, \
-                            { 'query': '{ search(type: USER, query: "in:name ' + c.author.name + '", first: 1) { edges { node { ... on User { login name url } } } } }' })
-                        if info:
-                            LOG.debug("      Found!")
-                            author_id = c.author.name
-                        else:
-                            # If not found, use local git info only and gravatar avatar
-                            LOG.info("Get user info from local GIT info for: " + c.author.name)
-                            info = { 'login':c.author.name if c.author.name else '', \
-                                'name':c.author.name if c.author.name else c.author.email, \
-                                'url':'#', \
-                                'avatar':'https://www.gravatar.com/avatar/' + hashlib.md5(c.author.email.encode('utf-8')).hexdigest() + '?d=identicon' }
-                            author_id = c.author.name
-            else:
-                # Already in cache
-                if c.author.email in self.authors:
-                    info = self.authors[c.author.email]
-                    author_id = c.author.email
-                else:
-                    info = self.authors[c.author.name]
-                    author_id = c.author.name
-            if (author_id not in seen_authors):
-                LOG.debug("Adding " + author_id + " to unique authors for this page")
-                self.authors[author_id] = info
-                seen_authors.append(author_id)
-                unique_authors.append(self.authors[author_id])
+            author_id, info = self.githubAuthorInfoFromUserOrEmail(c.author.name, c.author.email)
+            if info is not None:
+                if (author_id not in seen_authors):
+                    seen_authors.append(author_id)
+                    unique_authors.append(self.authors[author_id])
 
+
+        # Add contributors from metadata
+        if 'contributors' in page.meta:
+            users = page.meta['contributors'].split(',')
+            for author_name in users:
+                author_id, info = self.githubAuthorInfoFromUserOrEmail(author_name, None)
+                if info is None:
+                    LOG.debug("Info for " + author_name + " not found")
+                if info is not None:
+                    LOG.debug("Info for " + author_name + " found")
+                    if (author_id not in seen_authors):
+                        seen_authors.append(author_id)
+                        unique_authors.append(self.authors[author_id])
+
+        # Return list
         LOG.debug("Contributors for page " + path + ": " + str(unique_authors))
         return unique_authors, last_commit_date
 
@@ -152,7 +192,7 @@ class GitCommittersPlugin(BasePlugin):
             return context
         start = timer()
         git_path = self.config['docs_path'] + page.file.src_path
-        authors, last_commit_date = self.get_git_info(git_path)
+        authors, last_commit_date = self.get_git_info(git_path, page)
         if authors:
             context['committers'] = authors
         if last_commit_date:
